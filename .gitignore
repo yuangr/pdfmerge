@@ -3,3 +3,11 @@ __pycache__/
 build/
 dist/
 *.spec
+.env
+.env.*
+*.log
+*.pdf
+*.pem
+*.key
+.idea/
+.vscode/

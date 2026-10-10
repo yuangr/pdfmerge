@@ -1,9 +1,12 @@
 import os
 import threading
+import queue
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
-from pypdf import PdfWriter
+from page_organizer import PageOrganizer
+from pdf_operations import ensure_output_is_separate, merge_pdfs
 
 # Lock appearance mode to dark theme for unified Linear aesthetic
 ctk.set_appearance_mode("dark")
@@ -13,9 +16,9 @@ class PDFMergerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         
-        self.title("PDF 极速合并工具")
-        self.geometry("760x640")
-        self.minsize(680, 520)
+        self.title("PDF 合并与页面整理")
+        self.geometry("860x760")
+        self.minsize(780, 650)
         
         # Color Tokens (Linear Dark Theme)
         self.c_bg_primary = "#0B0B0C"
@@ -43,6 +46,9 @@ class PDFMergerApp(ctk.CTk):
         self.configure(fg_color=self.c_bg_primary)
         
         self.selected_files = []
+        self.is_merging = False
+        self.merge_events = queue.Queue()
+        self.merge_button_states = []
         
         # Configure grid layout
         self.grid_rowconfigure(1, weight=1)
@@ -55,7 +61,7 @@ class PDFMergerApp(ctk.CTk):
         
         self.title_label = ctk.CTkLabel(
             self.header_frame, 
-            text="PDF 极速合并工具", 
+            text="PDF 合并与页面整理",
             font=ctk.CTkFont(family="Segoe UI", size=24, weight="bold"),
             text_color=self.c_text_primary
         )
@@ -63,7 +69,7 @@ class PDFMergerApp(ctk.CTk):
         
         self.subtitle_label = ctk.CTkLabel(
             self.header_frame, 
-            text="极客风格的 PDF 合并小工具。选择文件，自由排序，一键合并。",
+            text="合并多个文件，或调整一份完整 PDF 的页面顺序。",
             font=ctk.CTkFont(family="Segoe UI", size=13),
             text_color=self.c_text_secondary
         )
@@ -198,6 +204,7 @@ class PDFMergerApp(ctk.CTk):
             text_color=self.c_text_muted,
             font=ctk.CTkFont(family="Segoe UI", size=13)
         )
+        self.status_label.configure(wraplength=480)
         self.status_label.grid(row=0, column=0, padx=5, pady=5, sticky="w")
         
         self.merge_btn = ctk.CTkButton(
@@ -213,8 +220,74 @@ class PDFMergerApp(ctk.CTk):
             command=self.start_merge
         )
         self.merge_btn.grid(row=0, column=1, padx=5, pady=5, sticky="e")
+
+        self.mode_switch = ctk.CTkSegmentedButton(
+            self.header_frame, values=["文件合并", "页面整理"],
+            command=self.switch_mode, selected_color=self.c_brand,
+            selected_hover_color=self.c_brand_hover,
+        )
+        self.mode_switch.grid(row=2, column=0, padx=25, pady=(0, 15), sticky="w")
+        self.page_organizer = PageOrganizer(self)
+        self.page_organizer.grid(row=1, column=0, sticky="nsew", padx=25, pady=(0, 20))
+        self.mode_switch.set("页面整理")
+        self.switch_mode("页面整理")
+        self.protocol("WM_DELETE_WINDOW", self.close_app)
+        self.after(100, self.poll_merge_events)
+
+    def switch_mode(self, mode):
+        if self.is_merging or self.page_organizer.busy:
+            return
+        if mode == "页面整理":
+            self.main_frame.grid_remove()
+            self.action_frame.grid_remove()
+            self.page_organizer.grid()
+        else:
+            self.page_organizer.grid_remove()
+            self.main_frame.grid()
+            self.action_frame.grid()
+
+    def close_app(self):
+        if self.is_merging or self.page_organizer.busy:
+            messagebox.showinfo("正在处理", "请等待 PDF 处理完成后再关闭窗口。", parent=self)
+            return
+        self.destroy()
+
+    def set_merge_busy(self, busy):
+        self.is_merging = busy
+        self.mode_switch.configure(state="disabled" if busy else "normal")
+        if busy:
+            self.merge_button_states = []
+
+            def disable_buttons(parent):
+                for widget in parent.winfo_children():
+                    if isinstance(widget, ctk.CTkButton):
+                        self.merge_button_states.append((widget, widget.cget("state")))
+                        widget.configure(state="disabled")
+                    else:
+                        disable_buttons(widget)
+
+            disable_buttons(self.main_frame)
+        else:
+            for widget, state in self.merge_button_states:
+                widget.configure(state=state)
+            self.merge_button_states = []
+        self.merge_btn.configure(state="disabled" if busy else "normal", text="正在合并..." if busy else "开始合并 PDF")
+
+    def poll_merge_events(self):
+        try:
+            success, result = self.merge_events.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            if success:
+                self.on_merge_success(result)
+            else:
+                self.on_merge_failure(result)
+        self.after(100, self.poll_merge_events)
         
     def add_files(self):
+        if self.is_merging:
+            return
         file_paths = filedialog.askopenfilenames(
             title="选择 PDF 文件",
             filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")]
@@ -237,6 +310,8 @@ class PDFMergerApp(ctk.CTk):
             self.update_status(f"已添加 {len(file_paths)} 个文件。当前共 {len(self.selected_files)} 个文件。")
             
     def clear_files(self):
+        if self.is_merging:
+            return
         if self.selected_files:
             if messagebox.askyesno("清空列表", "确定要清空待合并的文件列表吗？"):
                 self.selected_files.clear()
@@ -245,6 +320,8 @@ class PDFMergerApp(ctk.CTk):
                 self.update_status("已清空列表")
                 
     def choose_save_path(self):
+        if self.is_merging:
+            return
         initial_dir = None
         initial_file = "合并文件_合并.pdf"
         
@@ -281,18 +358,24 @@ class PDFMergerApp(ctk.CTk):
         self.save_path_entry.configure(state="readonly")
             
     def move_file_up(self, index):
+        if self.is_merging:
+            return
         if index > 0:
             self.selected_files[index], self.selected_files[index - 1] = \
                 self.selected_files[index - 1], self.selected_files[index]
             self.update_file_list_ui()
             
     def move_file_down(self, index):
+        if self.is_merging:
+            return
         if index < len(self.selected_files) - 1:
             self.selected_files[index], self.selected_files[index + 1] = \
                 self.selected_files[index + 1], self.selected_files[index]
             self.update_file_list_ui()
             
     def remove_file(self, index):
+        if self.is_merging:
+            return
         if 0 <= index < len(self.selected_files):
             removed = self.selected_files.pop(index)
             self.update_file_list_ui()
@@ -406,53 +489,39 @@ class PDFMergerApp(ctk.CTk):
         self.status_label.configure(text=text, text_color=color)
         
     def start_merge(self):
+        if self.is_merging:
+            return
         if not self.selected_files:
-            messagebox.showerror("错误", "请先选择需要合并的 PDF 文件！")
+            messagebox.showerror("错误", "请先选择需要合并的 PDF 文件！", parent=self)
             return
-            
         output_path = self.save_path_entry.get().strip()
-        
         if not output_path:
-            messagebox.showerror("错误", "请选择保存路径及文件名！")
+            messagebox.showerror("错误", "请选择保存路径及文件名！", parent=self)
             return
-            
         if not output_path.lower().endswith(".pdf"):
             output_path += ".pdf"
-            
-        # Disable merge button and show loading state
-        self.merge_btn.configure(state="disabled", text="正在合并...")
-        self.update_status("正在合并 PDF，请稍候...", "blue")
-        
-        # Start backend merge thread
-        thread = threading.Thread(target=self.execute_merge, args=(output_path,))
-        thread.daemon = True
-        thread.start()
-        
-    def execute_merge(self, output_path):
+        source_paths = tuple(self.selected_files)
         try:
-            # Ensure the output directory exists
-            output_dir = os.path.dirname(output_path)
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Perform PDF merge
-            merger = PdfWriter()
-            for file_path in self.selected_files:
-                if not os.path.exists(file_path):
-                    raise FileNotFoundError(f"文件不存在: {file_path}")
-                merger.append(file_path)
-                
-            merger.write(output_path)
-            merger.close()
-            
-            # Show success status on main thread
-            self.after(0, lambda: self.on_merge_success(output_path))
-            
-        except Exception as e:
-            # Show error status on main thread
-            self.after(0, lambda err=str(e): self.on_merge_failure(err))
-            
+            ensure_output_is_separate(output_path, source_paths)
+        except ValueError as error:
+            messagebox.showerror("无法合并", str(error), parent=self)
+            return
+        if os.path.exists(output_path) and not messagebox.askyesno("替换文件", f"目标文件已存在，是否替换？\n\n{output_path}", parent=self):
+            return
+        self.set_merge_busy(True)
+        self.update_status("正在合并并校验 PDF，请稍候...", "blue")
+        threading.Thread(target=self.execute_merge, args=(output_path, source_paths), daemon=True).start()
+
+    def execute_merge(self, output_path, source_paths):
+        # Workers only use the captured inputs and never access Tk widgets.
+        try:
+            merge_pdfs(source_paths, output_path)
+            self.merge_events.put((True, output_path))
+        except Exception as error:
+            self.merge_events.put((False, str(error)))
+
     def on_merge_success(self, output_path):
-        self.merge_btn.configure(state="normal", text="开始合并 PDF")
+        self.set_merge_busy(False)
         self.update_status(f"合并成功！保存至: {os.path.basename(output_path)}", "green")
         
         # Ask user if they want to open the merged file
@@ -463,10 +532,14 @@ class PDFMergerApp(ctk.CTk):
                 messagebox.showerror("错误", f"无法打开文件: {e}")
                 
     def on_merge_failure(self, error_message):
-        self.merge_btn.configure(state="normal", text="开始合并 PDF")
+        self.set_merge_busy(False)
         self.update_status("合并失败！", "red")
         messagebox.showerror("合并失败", f"合并过程中发生错误：\n{error_message}")
 
 if __name__ == "__main__":
     app = PDFMergerApp()
+    if "--smoke-test" in sys.argv:
+        # Packaging check: construct the real window and exercise its event loop.
+        app.withdraw()
+        app.after(200, app.destroy)
     app.mainloop()
